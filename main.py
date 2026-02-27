@@ -1,15 +1,12 @@
 """
-Xeo Exchanger Bot — FIXED VERSION
-- State is saved to JSON (survives restarts)
-- Photo/screenshot flow works correctly
-- Request flow works correctly
-Hosted on Render (Web Service) + UptimeRobot keep-alive
+Xeo Exchanger Bot — FIXED + DEBUG VERSION
 Requirements: pip install pyTelegramBotAPI
 """
 
 import os
 import json
 import threading
+import traceback
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -24,27 +21,30 @@ XEO_WALLET_URL = "https://xeowallet.vercel.app"
 
 EXCHANGE_TYPES = ["Fxl", "Rdx", "Vsv", "Ultra Pay", "Saathi"]
 
-# ─── DATA FILE ────────────────────────────────────────────────────────────────
+# ─── DATA ─────────────────────────────────────────────────────────────────────
 DATA_FILE = "xeo_data.json"
 
 def load_data():
     if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
+        try:
+            with open(DATA_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
     return {
         "total_exchanges": 0,
         "successful_exchanges": 0,
         "declined_exchanges": 0,
         "pending_exchanges": {},
         "requests": [],
-        "user_states": {}          # ← persisted state (fixes both bugs)
+        "user_states": {}
     }
 
 def save_data(d):
     with open(DATA_FILE, "w") as f:
         json.dump(d, f, indent=2)
 
-# ─── STATE HELPERS (read/write from JSON) ─────────────────────────────────────
+# ─── STATE (persisted to JSON) ────────────────────────────────────────────────
 def get_state(uid):
     d = load_data()
     return d.get("user_states", {}).get(str(uid), {})
@@ -77,6 +77,15 @@ def user_mention(user):
         return f"@{user.username} ({name})"
     return f"{name} [ID: {user.id}]"
 
+def safe_send_to_admin(text):
+    try:
+        bot.send_message(ADMIN_ID, text, parse_mode="Markdown")
+        return True, None
+    except Exception as e:
+        err = traceback.format_exc()
+        print(f"[ADMIN SEND ERROR] {e}\n{err}")
+        return False, str(e)
+
 # ─── KEYBOARDS ────────────────────────────────────────────────────────────────
 def main_keyboard():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
@@ -92,8 +101,8 @@ def cancel_keyboard():
 def admin_approval_keyboard(exchange_id):
     kb = types.InlineKeyboardMarkup()
     kb.add(
-        types.InlineKeyboardButton("✅ Approve", callback_data=f"approve_{exchange_id}"),
-        types.InlineKeyboardButton("❌ Decline", callback_data=f"decline_{exchange_id}")
+        types.InlineKeyboardButton("✅ Approve", callback_data=f"app_{exchange_id}"),
+        types.InlineKeyboardButton("❌ Decline", callback_data=f"dec_{exchange_id}")
     )
     return kb
 
@@ -111,15 +120,29 @@ def cmd_start(msg):
         reply_markup=main_keyboard()
     )
 
+# ─── /debug (admin only) ──────────────────────────────────────────────────────
+@bot.message_handler(commands=["debug"])
+def cmd_debug(msg):
+    if msg.from_user.id != ADMIN_ID:
+        return
+    d = load_data()
+    states  = d.get("user_states", {})
+    pending = d.get("pending_exchanges", {})
+    bot.send_message(
+        msg.chat.id,
+        f"🔧 *Debug Info*\n\n"
+        f"Active states: `{json.dumps(states, indent=2)}`\n\n"
+        f"Pending: `{len(pending)}`\n"
+        f"Token OK: `{'Yes' if BOT_TOKEN and BOT_TOKEN != 'YOUR_BOT_TOKEN_HERE' else 'NO!'}`\n"
+        f"Admin ID: `{ADMIN_ID}`",
+        parse_mode="Markdown"
+    )
+
 # ─── CANCEL ───────────────────────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: m.text == "❌ Cancel")
 def handle_cancel(msg):
     clear_state(msg.from_user.id)
-    bot.send_message(
-        msg.chat.id,
-        "❌ Cancelled. Back to main menu.",
-        reply_markup=main_keyboard()
-    )
+    bot.send_message(msg.chat.id, "❌ Cancelled. Back to main menu.", reply_markup=main_keyboard())
 
 # ─── STATS ────────────────────────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: m.text == "📊 Stats")
@@ -138,12 +161,7 @@ def handle_stats(msg):
         f"❌ *Declined:* {d.get('declined_exchanges', 0)}\n"
         f"⏳ *Pending:* {len(d.get('pending_exchanges', {}))}"
     )
-    bot.send_message(
-        msg.chat.id,
-        text,
-        parse_mode="Markdown",
-        reply_markup=main_keyboard()
-    )
+    bot.send_message(msg.chat.id, text, parse_mode="Markdown", reply_markup=main_keyboard())
 
 # ─── REQUEST ──────────────────────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: m.text == "📋 Request")
@@ -167,8 +185,7 @@ def handle_exchange_type(msg):
     bot.send_message(
         msg.chat.id,
         f"💱 *{fund} Exchange*\n\n"
-        f"💰 How much do you want to exchange?\n"
-        f"_(Enter the amount)_",
+        f"💰 How much do you want to exchange?\n_(Enter the amount)_",
         parse_mode="Markdown",
         reply_markup=cancel_keyboard()
     )
@@ -180,7 +197,8 @@ def handle_text(msg):
     state = get_state(uid)
     step  = state.get("step")
 
-    # ── Awaiting fund request text ──
+    print(f"[TEXT] uid={uid} step={step} text={msg.text!r}")
+
     if step == "awaiting_request":
         req_text = msg.text.strip()
         d = load_data()
@@ -191,44 +209,46 @@ def handle_text(msg):
             "time":     datetime.now().strftime("%Y-%m-%d %H:%M")
         })
         save_data(d)
-        try:
-            bot.send_message(
-                ADMIN_ID,
-                f"📋 *New Fund Request*\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"👤 From: {user_mention(msg.from_user)}\n"
-                f"🆔 User ID: `{uid}`\n"
-                f"📝 Request: *{req_text}*\n"
-                f"🕐 Time: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            print(f"[ERROR] Could not notify admin: {e}")
-        clear_state(uid)
-        bot.send_message(
-            msg.chat.id,
-            "✅ *Request sent!*\n\n"
-            "Your request has been forwarded to the admin. "
-            "We'll review it and add it if possible. Thank you! 🙏",
-            parse_mode="Markdown",
-            reply_markup=main_keyboard()
-        )
 
-    # ── Awaiting amount ──
+        admin_msg = (
+            f"📋 *New Fund Request*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 From: {user_mention(msg.from_user)}\n"
+            f"🆔 User ID: `{uid}`\n"
+            f"📝 Request: *{req_text}*\n"
+            f"🕐 Time: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        )
+        ok, err = safe_send_to_admin(admin_msg)
+        print(f"[REQUEST] Admin notify: ok={ok} err={err}")
+
+        clear_state(uid)
+        if ok:
+            bot.send_message(
+                msg.chat.id,
+                "✅ *Request sent!*\n\nYour request has been forwarded to the admin. Thank you! 🙏",
+                parse_mode="Markdown",
+                reply_markup=main_keyboard()
+            )
+        else:
+            bot.send_message(
+                msg.chat.id,
+                f"⚠️ Request saved but failed to notify admin.\nError: `{err}`\nContact @XeoSupportBot.",
+                parse_mode="Markdown",
+                reply_markup=main_keyboard()
+            )
+
     elif step == "awaiting_amount":
         amount = msg.text.strip()
         set_state(uid, step="awaiting_xid", amount=amount)
         bot.send_message(
             msg.chat.id,
             f"📱 *Enter your XID or Mobile Number*\n\n"
-            f"Please provide your XID or the mobile number "
-            f"linked to your [Xeo Wallet]({XEO_WALLET_URL}):",
+            f"Please provide your XID or mobile number linked to your [Xeo Wallet]({XEO_WALLET_URL}):",
             parse_mode="Markdown",
             disable_web_page_preview=False,
             reply_markup=cancel_keyboard()
         )
 
-    # ── Awaiting XID / mobile ──
     elif step == "awaiting_xid":
         xid    = msg.text.strip()
         fund   = state.get("fund")
@@ -242,27 +262,21 @@ def handle_text(msg):
             f"💰 Amount: *{amount}*\n\n"
             f"Please send to this number:\n"
             f"📞 `{ADMIN_NUMBER}`\n\n"
-            f"After sending, upload a *screenshot* of your payment here as proof. 📸",
+            f"After sending, upload a *screenshot* of your payment here. 📸",
             parse_mode="Markdown",
             reply_markup=cancel_keyboard()
         )
 
-    # ── Awaiting screenshot but user sent text ──
     elif step == "awaiting_screenshot":
         bot.send_message(
             msg.chat.id,
-            "📸 Please send a *screenshot* (photo) of your payment, not text.",
+            "📸 Please send a *photo* (screenshot) of your payment, not text.",
             parse_mode="Markdown",
             reply_markup=cancel_keyboard()
         )
 
-    # ── No state / unknown ──
     else:
-        bot.send_message(
-            msg.chat.id,
-            "Please use the menu below to get started. 👇",
-            reply_markup=main_keyboard()
-        )
+        bot.send_message(msg.chat.id, "Please use the menu below. 👇", reply_markup=main_keyboard())
 
 # ─── PHOTO / SCREENSHOT ───────────────────────────────────────────────────────
 @bot.message_handler(content_types=["photo"])
@@ -271,7 +285,8 @@ def handle_screenshot(msg):
     state = get_state(uid)
     step  = state.get("step")
 
-    # If not in the right step, guide user
+    print(f"[PHOTO] uid={uid} step={step}")
+
     if step != "awaiting_screenshot":
         bot.send_message(
             msg.chat.id,
@@ -301,6 +316,7 @@ def handle_screenshot(msg):
     )
 
     photo_id = msg.photo[-1].file_id
+    print(f"[PHOTO] Forwarding to admin. exchange_id={exchange_id} photo_id={photo_id}")
 
     try:
         sent = bot.send_photo(
@@ -310,12 +326,14 @@ def handle_screenshot(msg):
             parse_mode="Markdown",
             reply_markup=admin_approval_keyboard(exchange_id)
         )
-        admin_msg_id = sent.message_id
+        print(f"[PHOTO] Admin notified. msg_id={sent.message_id}")
     except Exception as e:
-        print(f"[ERROR] Could not send to admin: {e}")
+        err = traceback.format_exc()
+        print(f"[PHOTO ERROR] {e}\n{err}")
         bot.send_message(
             msg.chat.id,
-            "⚠️ There was an error submitting your request. Please try again or contact @XeoSupportBot.",
+            f"⚠️ *Submission failed.*\n\nError: `{str(e)}`\n\nPlease contact @XeoSupportBot.",
+            parse_mode="Markdown",
             reply_markup=main_keyboard()
         )
         return
@@ -325,7 +343,7 @@ def handle_screenshot(msg):
         "fund":         fund,
         "amount":       amount,
         "xid":          xid,
-        "admin_msg_id": admin_msg_id,
+        "admin_msg_id": sent.message_id,
         "time":         now
     }
     save_data(d)
@@ -342,14 +360,17 @@ def handle_screenshot(msg):
     )
 
 # ─── ADMIN: Approve / Decline ─────────────────────────────────────────────────
-@bot.callback_query_handler(func=lambda c: c.data.startswith(("approve_", "decline_")))
+@bot.callback_query_handler(func=lambda c: c.data.startswith(("app_", "dec_")))
 def handle_admin_action(call):
     if call.from_user.id != ADMIN_ID:
-        bot.answer_callback_query(call.id, "⛔ You are not authorized.")
+        bot.answer_callback_query(call.id, "⛔ Not authorized.")
         return
 
-    action, exchange_id = call.data.split("_", 1)
-    d = load_data()
+    parts       = call.data.split("_", 1)
+    action      = parts[0]
+    exchange_id = parts[1]
+
+    d        = load_data()
     exchange = d["pending_exchanges"].get(exchange_id)
 
     if not exchange:
@@ -361,7 +382,7 @@ def handle_admin_action(call):
     amount  = exchange["amount"]
     xid     = exchange["xid"]
 
-    if action == "approve":
+    if action == "app":
         d["successful_exchanges"] = d.get("successful_exchanges", 0) + 1
         try:
             bot.send_message(
@@ -371,14 +392,14 @@ def handle_admin_action(call):
                 f"💱 Fund Type: *{fund}*\n"
                 f"💰 Amount: *{amount}*\n"
                 f"📱 XID/Mobile: `{xid}`\n\n"
-                f"Your exchange has been completed successfully! ✅\n"
+                f"Your exchange has been completed! ✅\n"
                 f"Thank you for using *Xeo Exchanger!* 🚀",
                 parse_mode="Markdown"
             )
         except Exception as e:
-            print(f"[ERROR] Could not notify user: {e}")
+            print(f"[APPROVE] User notify error: {e}")
         new_caption = (call.message.caption or "") + "\n\n━━━━━━━━━━━━━━━━━━━━\n✅ *APPROVED*"
-        bot.answer_callback_query(call.id, "✅ Approved and user notified!")
+        bot.answer_callback_query(call.id, "✅ Approved!")
 
     else:
         d["declined_exchanges"] = d.get("declined_exchanges", 0) + 1
@@ -389,14 +410,14 @@ def handle_admin_action(call):
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"💱 Fund Type: *{fund}*\n"
                 f"💰 Amount: *{amount}*\n\n"
-                f"Unfortunately your exchange request was declined.\n"
-                f"For help, contact support: @XeoSupportBot 💬",
+                f"Your request was declined.\n"
+                f"Contact support: @XeoSupportBot 💬",
                 parse_mode="Markdown"
             )
         except Exception as e:
-            print(f"[ERROR] Could not notify user: {e}")
+            print(f"[DECLINE] User notify error: {e}")
         new_caption = (call.message.caption or "") + "\n\n━━━━━━━━━━━━━━━━━━━━\n❌ *DECLINED*"
-        bot.answer_callback_query(call.id, "❌ Declined and user notified!")
+        bot.answer_callback_query(call.id, "❌ Declined!")
 
     try:
         bot.edit_message_caption(
@@ -406,32 +427,32 @@ def handle_admin_action(call):
             parse_mode="Markdown"
         )
     except Exception as e:
-        print(f"[ERROR] Could not edit admin message: {e}")
+        print(f"[EDIT CAPTION ERROR] {e}")
 
     del d["pending_exchanges"][exchange_id]
     save_data(d)
 
-# ─── KEEP-ALIVE WEB SERVER (Render + UptimeRobot) ─────────────────────────────
+# ─── KEEP-ALIVE WEB SERVER ────────────────────────────────────────────────────
 class PingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Xeo Exchanger Bot is alive!")
-
     def log_message(self, format, *args):
         pass
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), PingHandler)
-    print(f"🌐 Web server running on port {port}")
+    print(f"🌐 Web server on port {port}")
     server.serve_forever()
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("🚀 Xeo Exchanger Bot is starting...")
+    print(f"🚀 Starting Xeo Exchanger Bot...")
+    print(f"   Admin ID : {ADMIN_ID}")
+    print(f"   Token set: {'YES' if BOT_TOKEN and BOT_TOKEN != 'YOUR_BOT_TOKEN_HERE' else 'NO - SET BOT_TOKEN!'}")
     web_thread = threading.Thread(target=run_web)
     web_thread.daemon = True
     web_thread.start()
-    print("🤖 Bot polling started...")
     bot.infinity_polling()
